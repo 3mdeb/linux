@@ -25,7 +25,7 @@ u16 tpm2_null_auth(struct tpms_auth_cmd *a)
 {
 	memset(a, 0, NULL_AUTH_SIZE);
 
-	*a->handle = cpu_to_be32(TPM_RS_PW);
+	a->handle = cpu_to_be32(TPM_RS_PW);
 
 	return NULL_AUTH_SIZE;
 }
