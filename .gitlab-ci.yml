@@ -8,7 +8,7 @@ build:
     - local
     - build
   before_script:
-    - apt-get update && apt-get install -y build-essential bc libelf-dev libssl-dev
+    - apt-get update && apt-get install -y build-essential bc bison flex libelf-dev libssl-dev
   script:
     - make securelaunch_defconfig
     - make -j8
