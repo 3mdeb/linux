@@ -7,6 +7,8 @@ build:
   tags:
     - local
     - build
+  except:
+    - feat_gitlabci
   before_script:
     - apt-get update && apt-get install -y build-essential bc bison flex libelf-dev libssl-dev
   script:
@@ -18,6 +20,8 @@ build:
 
 build_nixpkg:
   stage: build
+  except:
+    - feat_gitlabci
   variables:
     NIXPKG: "linux"
     LINUX_COMMIT: "$CI_COMMIT_SHA"
@@ -26,3 +30,22 @@ build_nixpkg:
     project: trenchboot1/3mdeb/nixos-trenchboot-configs
     branch: master
     strategy: depend
+
+build_debian_pkg:
+  stage: build
+  image: debian:stable-20200414
+  tags:
+    - local
+  only:
+    - feat_gitlabci
+  before_script:
+    - ./.gitlab-ci/install-debian-build-deps.sh
+    - git pull . master
+  script:
+    - make debian_defconfig
+    - make deb-pkg LOCALVERSION=-trenchboot KDEB_PKGVERSION=$(make kernelversion)-1 DEBEMAIL=debian@3mdeb.com DEBFULLNAME=debian
+    - mkdir artifacts && mv ../*.deb artifacts/
+    - ./.gitlab-ci/show-package-content.sh
+  artifacts:
+    paths:
+      - artifacts/*
