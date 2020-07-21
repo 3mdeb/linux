@@ -23,8 +23,6 @@
 #include <linux/magic.h>
 
 static struct vfsmount *mount;
-static int mount_count;
-
 static void securityfs_free_inode(struct inode *inode)
 {
 	if (S_ISLNK(inode->i_mode))
