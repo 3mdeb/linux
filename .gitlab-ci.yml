@@ -9,7 +9,7 @@ build:
     - local
     - build
   except:
-    - feat_gitlabci
+    - debian
   before_script:
     - apt-get update && apt-get install -y build-essential bc bison flex libelf-dev libssl-dev
   script:
@@ -22,7 +22,7 @@ build:
 build_nixpkg:
   stage: build
   except:
-    - feat_gitlabci
+    - debian
   variables:
     NIXPKG: "linux"
     LINUX_COMMIT: "$CI_COMMIT_SHA"
@@ -37,8 +37,8 @@ git_pull:
   stage: git-robot
   tags:
     - local
-  except: 
-    - feat_gitlabci
+  only: 
+    - linux-sl-5.5
   before_script:
     - echo "machine github.com
               login 3mdeb-robot
@@ -47,10 +47,10 @@ git_pull:
     - git config --global user.email "robot@3mdeb.com"
     - git config --global user.name "3mdeb-robot"
   script:
-    - git clone https://github.com/3mdeb/linux.git -b feat_gitlabci
+    - git clone https://github.com/3mdeb/linux.git -b debian
     - cd linux
     - git pull . origin/linux-sl-5.5
-    - git push origin feat_gitlabci
+    - git push origin debian
 
 build_debian_pkg:
   stage: build
@@ -58,7 +58,7 @@ build_debian_pkg:
   tags:
     - local
   only:
-    - feat_gitlabci
+    - debian
   before_script:
     - ./.gitlab-ci/install-debian-build-deps.sh
   script:
