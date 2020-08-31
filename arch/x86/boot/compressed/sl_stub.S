@@ -33,6 +33,21 @@
 	.byte 	0x0f, 0x37	/* GETSEC opcode */
 .endm
 
+.macro TXT_RESET error
+	/*
+	 * Set a sticky error value and reset. Note the movs to %eax act as
+	 * TXT register barriers.
+	 */
+	movl	\error, (TXT_PRIV_CONFIG_REGS_BASE + TXT_CR_ERRORCODE)
+	movl	(TXT_PRIV_CONFIG_REGS_BASE + TXT_CR_E2STS), %eax
+	movl	$1, (TXT_PRIV_CONFIG_REGS_BASE + TXT_CR_CMD_NO_SECRETS)
+	movl	(TXT_PRIV_CONFIG_REGS_BASE + TXT_CR_E2STS), %eax
+	movl	$1, (TXT_PRIV_CONFIG_REGS_BASE + TXT_CR_CMD_UNLOCK_MEM_CONFIG)
+	movl	(TXT_PRIV_CONFIG_REGS_BASE + TXT_CR_E2STS), %eax
+	movl	$1, (TXT_PRIV_CONFIG_REGS_BASE + TXT_CR_CMD_RESET)
+	hlt
+.endm
+
 	/*
 	 * The MLE Header per the TXT Specification, section 2.1
 	 * MLE capabilities, see table 2.
@@ -128,8 +143,14 @@ SYM_FUNC_START(sl_stub)
 	/* Skip over BIOS data and size of OS to MLE data section */
 	leal	8(%eax, %ecx), %eax
 
-	/* Get the zero page address from the heap.
-	 *
+	/* Check that the AP wake block is big enough */
+	cmpl	$(TXT_WAKE_BLOCK_SIZE), SL_ap_wake_block_size(%eax)
+	jae	.Lwake_block_ok
+	TXT_RESET $(SL_ERROR_WAKE_BLOCK_TOO_SMALL)
+
+.Lwake_block_ok:
+	/*
+	 * Get the zero page address from the heap.
 	 * Note %esi and %ebp MUST be preserved across calls and
 	 * operations.
 	 */
@@ -240,15 +261,17 @@ SYM_FUNC_START(sl_txt_ap_entry)
 	/* Unlock */
 	movl	$0, sl_txt_spin_lock(%ebp)
 
-	/* Load our AP stack */
+	/* Location of the relocated AP wake block */
+	movl	sl_txt_ap_wake_block(%ebp), %ecx
+
+	/* Load our reloc AP stack */
 	movl	$(TXT_BOOT_STACK_SIZE), %edx
 	mull	%edx
-	leal	sl_stacks_end(%ebp), %esp
+	leal	(sl_stacks_end - sl_txt_ap_wake_begin)(%ecx), %esp
 	subl	%eax, %esp
 
 	/* Load reloc GDT, set segment regs and lret to __SL32_CS */
-	movl	sl_txt_ap_wake_block(%ebp), %eax
-	lgdt	(sl_ap_gdt_desc - sl_txt_ap_wake_begin)(%eax)
+	lgdt	(sl_ap_gdt_desc - sl_txt_ap_wake_begin)(%ecx)
 
 	movl	$(__SL32_DS), %eax
 	movw	%ax, %ds
@@ -264,8 +287,7 @@ SYM_FUNC_START(sl_txt_ap_entry)
 
 .Lsl_ap_cs:
 	/* Load the relocated AP IDT */
-	movl	sl_txt_ap_wake_block(%ebp), %eax
-	lidt	(sl_ap_idt_desc - sl_txt_ap_wake_begin)(%eax)
+	lidt	(sl_ap_idt_desc - sl_txt_ap_wake_begin)(%ecx)
 
 	/* Fixup MTRRs and misc enable MSR on APs too */
 	call	sl_txt_load_regs
@@ -497,14 +519,7 @@ SYM_FUNC_START(sl_txt_int_ipi_wake)
 SYM_FUNC_END(sl_txt_int_ipi_wake)
 
 SYM_FUNC_START(sl_txt_int_reset)
-	/* Set a sticky error value and reset */
-	movl	$(SL_ERROR_INV_AP_INTERRUPT), (TXT_PRIV_CONFIG_REGS_BASE + TXT_CR_ERRORCODE)
-	/* The movs to %eax act as TXT register barriers */
-	movl	(TXT_PRIV_CONFIG_REGS_BASE + TXT_CR_E2STS), %eax
-	movl	$1, (TXT_PRIV_CONFIG_REGS_BASE + TXT_CR_CMD_UNLOCK_MEM_CONFIG)
-	movl	(TXT_PRIV_CONFIG_REGS_BASE + TXT_CR_E2STS), %eax
-	movl	$1, (TXT_PRIV_CONFIG_REGS_BASE + TXT_CR_CMD_RESET)
-	hlt
+	TXT_RESET $(SL_ERROR_INV_AP_INTERRUPT)
 SYM_FUNC_END(sl_txt_int_reset)
 
 	.balign 16
@@ -535,6 +550,12 @@ sl_ap_gdt:
 	.quad	0x00cf9a000000ffff	/* __SL32_CS */
 	.quad	0x00cf92000000ffff	/* __SL32_DS */
 sl_ap_gdt_end:
+
+	/* Small stacks for BSP and APs to work with */
+	.balign 4
+sl_stacks:
+	.fill (TXT_MAX_CPUS * TXT_BOOT_STACK_SIZE), 1, 0
+sl_stacks_end:
 
 /* This is the end of the relocated AP wake code block */
 	.global sl_txt_ap_wake_end
@@ -576,9 +597,3 @@ sl_txt_cpu_count:
 
 sl_txt_ap_wake_block:
 	.long	0x00000000
-
-	/* Small stacks for BSP and APs to work with */
-	.balign 4
-sl_stacks:
-	.fill (TXT_MAX_CPUS * TXT_BOOT_STACK_SIZE), 1, 0
-sl_stacks_end:
