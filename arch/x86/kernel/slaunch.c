@@ -70,6 +70,8 @@ static void __init slaunch_txt_reset(void __iomem *txt,
 	 */
 	memcpy_toio(txt + TXT_CR_ERRORCODE, &error, sizeof(u64));
 	memcpy_fromio(&val, txt + TXT_CR_E2STS, sizeof(u64));
+	memcpy_toio(txt + TXT_CR_CMD_NO_SECRETS, &one, sizeof(u64));
+	memcpy_fromio(&val, txt + TXT_CR_E2STS, sizeof(u64));
 	memcpy_toio(txt + TXT_CR_CMD_UNLOCK_MEM_CONFIG, &one, sizeof(u64));
 	memcpy_fromio(&val, txt + TXT_CR_E2STS, sizeof(u64));
 	memcpy_toio(txt + TXT_CR_CMD_RESET, &one, sizeof(u64));
@@ -140,7 +142,7 @@ static void __init *txt_early_get_heap_table(void __iomem *txt, u32 type,
 static void __init slaunch_verify_pmrs(void __iomem *txt)
 {
 	struct txt_os_sinit_data *os_sinit_data;
-	unsigned long last_pfn;
+	unsigned long last_pfn, initrd_extent;
 	u32 field_offset, err = 0;
 	const char *errmsg = "";
 
@@ -180,7 +182,8 @@ static void __init slaunch_verify_pmrs(void __iomem *txt)
 
 	/*
 	 * Check that if the kernel was loaded below 4G, that it is protected
-	 * by the lo PMR.
+	 * by the lo PMR. Note this is the decompressed kernel. The ACM would
+	 * have ensured the compressed kernel (the MLE image) was protected.
 	 */
 	if ((__pa_symbol(_end) < 0x100000000ULL) &&
 	    (__pa_symbol(_end) > os_sinit_data->vtd_pmr_lo_size)) {
@@ -194,6 +197,22 @@ static void __init slaunch_verify_pmrs(void __iomem *txt)
 	    os_sinit_data->vtd_pmr_lo_size) {
 		err = SL_ERROR_LO_PMR_MLE;
 		errmsg = "Error lo PMR does not cover AP wake block\n";
+	}
+
+	/*
+	 * If an external initrd is present and loaded below 4G, check
+	 * that it is protected by the lo PMR.
+	 */
+	if (boot_params.hdr.ramdisk_image != 0 &&
+	    boot_params.hdr.ramdisk_size != 0) {
+		initrd_extent = boot_params.hdr.ramdisk_image +
+				boot_params.hdr.ramdisk_size;
+		if ((initrd_extent < 0x100000000ULL) &&
+		    (initrd_extent > os_sinit_data->vtd_pmr_lo_size)) {
+			err = SL_ERROR_LO_PMR_INITRD;
+			errmsg = "Error lo PMR does not cover external initrd\n";
+			goto out;
+		}
 	}
 
 out:
@@ -339,19 +358,16 @@ static void __init slaunch_fetch_ap_wake_block(void __iomem *txt)
 {
 	struct txt_os_mle_data *os_mle_data;
 	u8 *jmp_offset;
-	u32 field_offset;
 
-	field_offset = offsetof(struct txt_os_mle_data, event_log_buffer);
 	os_mle_data = txt_early_get_heap_table(txt, TXT_OS_MLE_DATA_TABLE,
-					       field_offset);
+					       sizeof(struct txt_os_mle_data));
 
 	ap_wake_info.ap_wake_block = os_mle_data->ap_wake_block;
 
-	jmp_offset = ((u8 *)&os_mle_data->mle_scratch)
-			+ SL_SCRATCH_AP_JMP_OFFSET;
+	jmp_offset = os_mle_data->mle_scratch + SL_SCRATCH_AP_JMP_OFFSET;
 	ap_wake_info.ap_jmp_offset = *((u32 *)jmp_offset);
 
-	early_memunmap(os_mle_data, field_offset);
+	early_memunmap(os_mle_data, sizeof(struct txt_os_mle_data));
 }
 
 /*
@@ -455,21 +471,29 @@ void __init slaunch_setup(void)
  */
 struct memfile {
 	char *name;
-	void __iomem *addr;
+	void *addr;
 	size_t size;
 };
 
 static struct memfile sl_evtlog = {"eventlog", 0, 0};
-static void __iomem *txt_heap;
+static void *txt_heap;
 static struct txt_heap_event_log_pointer2_1_element __iomem *evtlog20;
-
-static DEFINE_MUTEX(sl_evt_write_mutex);
+static DEFINE_MUTEX(sl_evt_log_mutex);
 
 static ssize_t sl_evtlog_read(struct file *file, char __user *buf,
 			      size_t count, loff_t *pos)
 {
-	return simple_read_from_buffer(buf, count, pos,
-		sl_evtlog.addr, sl_evtlog.size);
+	ssize_t size;
+
+	if (!sl_evtlog.addr)
+		return 0;
+
+	mutex_lock(&sl_evt_log_mutex);
+	size = simple_read_from_buffer(buf, count, pos, sl_evtlog.addr,
+				       sl_evtlog.size);
+	mutex_unlock(&sl_evt_log_mutex);
+
+	return size;
 }
 
 static ssize_t sl_evtlog_write(struct file *file, const char __user *buf,
@@ -477,6 +501,9 @@ static ssize_t sl_evtlog_write(struct file *file, const char __user *buf,
 {
 	char *data;
 	ssize_t result;
+
+	if (!sl_evtlog.addr)
+		return 0;
 
 	/* No partial writes. */
 	result = -EINVAL;
@@ -489,13 +516,13 @@ static ssize_t sl_evtlog_write(struct file *file, const char __user *buf,
 		goto out;
 	}
 
-	mutex_lock(&sl_evt_write_mutex);
+	mutex_lock(&sl_evt_log_mutex);
 	if (evtlog20)
 		result = tpm20_log_event(evtlog20, sl_evtlog.addr,
 					 datalen, data);
 	else
 		result = tpm12_log_event(sl_evtlog.addr, datalen, data);
-	mutex_unlock(&sl_evt_write_mutex);
+	mutex_unlock(&sl_evt_log_mutex);
 
 	kfree(data);
 out:
@@ -555,14 +582,16 @@ static void slaunch_teardown_securityfs(void)
 		securityfs_remove(fs_entries[i]);
 
 	if (sl_flags & SL_FLAG_ARCH_TXT) {
+		if (sl_evtlog.addr) {
+			memunmap(sl_evtlog.addr);
+			sl_evtlog.addr = NULL;
+		}
+		sl_evtlog.size = 0;
 		if (txt_heap) {
 			memunmap(txt_heap);
 			txt_heap = NULL;
 		}
 	}
-
-	sl_evtlog.addr = 0;
-	sl_evtlog.size = 0;
 }
 
 static void slaunch_intel_evtlog(void)
@@ -592,8 +621,13 @@ static void slaunch_intel_evtlog(void)
 
 	params = (struct txt_os_mle_data *)txt_os_mle_data_start(txt_heap);
 
-	sl_evtlog.size = TXT_MAX_EVENT_LOG_SIZE;
-	sl_evtlog.addr = (void __iomem *)&params->event_log_buffer[0];
+	sl_evtlog.size = params->evtlog_size;
+	sl_evtlog.addr = memremap(params->evtlog_addr, params->evtlog_size,
+				  MEMREMAP_WB);
+	if (!sl_evtlog.addr) {
+		pr_err("Error failed to memremap TPM event log\n");
+		return;
+	}
 
 	/* Determine if this is TPM 1.2 or 2.0 event log */
 	if (memcmp(sl_evtlog.addr + sizeof(struct tpm12_pcr_event),

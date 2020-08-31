@@ -93,7 +93,6 @@
 /*
  * OS/MLE Secure Launch Specific Definitions
  */
-#define TXT_MAX_EVENT_LOG_SIZE		(5*4*1024)   /* 4k*5 */
 #define TXT_MAX_VARIABLE_MTRRS		32
 #define TXT_OS_MLE_STRUCT_VERSION	1
 
@@ -134,13 +133,16 @@
 #define SL_ERROR_HI_PMR_SIZE		0xc0008015
 #define SL_ERROR_LO_PMR_BASE		0xc0008016
 #define SL_ERROR_LO_PMR_MLE		0xc0008017
-#define SL_ERROR_HEAP_ZERO_OFFSET	0xc0008018
+#define SL_ERROR_LO_PMR_INITRD		0xc0008018
+#define SL_ERROR_HEAP_ZERO_OFFSET	0xc0008019
+#define SL_ERROR_WAKE_BLOCK_TOO_SMALL	0xc000801a
 
 /*
  * Secure Launch Defined Limits
  */
 #define TXT_MAX_CPUS		512
 #define TXT_BOOT_STACK_SIZE	24
+#define TXT_WAKE_BLOCK_SIZE	0x4000
 
 /*
  * Secure Launch event log entry type. The TXT specification defines the
@@ -160,6 +162,7 @@
  */
 #define SL_SCRATCH_AP_EBP		0
 #define SL_SCRATCH_AP_JMP_OFFSET	4
+#define SL_SCRATCH_AP_PAUSE		8
 
 #ifndef __ASSEMBLY__
 
@@ -167,7 +170,7 @@
  * Secure Launch AP wakeup information fetched in SMP boot code.
  */
 struct sl_ap_wake_info {
-	u64 ap_wake_block;
+	u32 ap_wake_block;
 	u32 ap_jmp_offset;
 };
 
@@ -222,13 +225,14 @@ struct txt_mtrr_state {
 struct txt_os_mle_data {
 	u32 version;
 	u32 zero_page_addr;
-	u8 msb_key_hash[20];
+	u8 msb_key_hash[64];
 	u64 saved_misc_enable_msr;
 	struct txt_mtrr_state saved_bsp_mtrrs;
-	u64 ap_wake_block;
-	/* These two fields should always be last */
-	u64 mle_scratch;
-	u8 event_log_buffer[TXT_MAX_EVENT_LOG_SIZE];
+	u32 ap_wake_block;
+	u32 ap_wake_block_size;
+	u64 evtlog_addr;
+	u32 evtlog_size;
+	u8 mle_scratch[16];
 } __packed;
 
 /*
