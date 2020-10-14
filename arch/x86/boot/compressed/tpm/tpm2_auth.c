@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (c) 2019 Apertus Solutions, LLC
+ * Copyright (c) 2020 Apertus Solutions, LLC
  *
  * Author(s):
  *      Daniel P. Smith <dpsmith@apertussolutions.com>
@@ -8,6 +8,7 @@
  */
 
 #include <linux/types.h>
+#include <linux/const.h>
 #include <linux/string.h>
 #include <asm/byteorder.h>
 #include "tpm.h"
@@ -26,18 +27,18 @@ u8 *tpm2_null_auth(struct tpmbuff *b)
 {
 	u32 *handle;
 	u8 *auth = (u8 *)tpmb_put(b, NULL_AUTH_SIZE);
-	if (auth == NULL)
-		goto out;
+
+	if (!auth)
+		return NULL;
 
 	memset(auth, 0, NULL_AUTH_SIZE);
 
 	/*
-	* The handle, the first element, is the
-	* only non-zero value in a NULL auth
-	*/
+	 * The handle, the first element, is the
+	 * only non-zero value in a NULL auth
+	 */
 	handle = (u32 *)auth;
 	*handle = cpu_to_be32(TPM_RS_PW);
 
-out:
 	return auth;
 }

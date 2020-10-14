@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (c) 2019 Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2019 Apertus Solutions, LLC
+ * Secure Launch late validation/setup, securityfs exposure and
+ * finalization support.
+ *
+ * Copyright (c) 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2020 Apertus Solutions, LLC
  *
  * Author(s):
  *     Daniel P. Smith <dpsmith@apertussolutions.com>
- *
+ *     Garnet T. Grimm <grimmg@ainfosec.com>
  */
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/fs.h>
 #include <linux/init.h>
@@ -29,10 +34,11 @@
 #include <asm/setup.h>
 #include <linux/slaunch.h>
 
-#define PREFIX	"SLAUNCH: "
-
 static u32 sl_flags;
 static struct sl_ap_wake_info ap_wake_info;
+static u64 evtlog_addr;
+static u32 evtlog_size;
+static u64 vtd_pmr_lo_size;
 
 /* This should be plenty of room */
 static u8 txt_dmar[PAGE_SIZE] __aligned(16);
@@ -57,8 +63,8 @@ struct acpi_table_header *slaunch_get_dmar_table(struct acpi_table_header *dmar)
 	return (struct acpi_table_header *)(&txt_dmar[0]);
 }
 
-static void __init slaunch_txt_reset(void __iomem *txt,
-				     const char *msg, u64 error)
+static void __init __noreturn slaunch_txt_reset(void __iomem *txt,
+						const char *msg, u64 error)
 {
 	u64 one = 1, val;
 
@@ -76,7 +82,10 @@ static void __init slaunch_txt_reset(void __iomem *txt,
 	memcpy_fromio(&val, txt + TXT_CR_E2STS, sizeof(u64));
 	memcpy_toio(txt + TXT_CR_CMD_RESET, &one, sizeof(u64));
 
-	asm volatile ("hlt");
+	for ( ; ; )
+		asm volatile ("hlt");
+
+	unreachable();
 }
 
 /*
@@ -150,6 +159,9 @@ static void __init slaunch_verify_pmrs(void __iomem *txt)
 	os_sinit_data = txt_early_get_heap_table(txt, TXT_OS_SINIT_DATA_TABLE,
 						 field_offset);
 
+	/* Save a copy */
+	vtd_pmr_lo_size = os_sinit_data->vtd_pmr_lo_size;
+
 	last_pfn = e820__end_of_ram_pfn();
 
 	/*
@@ -222,49 +234,52 @@ out:
 		slaunch_txt_reset(txt, errmsg, err);
 }
 
-static int __init slaunch_txt_reserve_range(u64 base, u64 size)
+static void __init slaunch_txt_reserve_range(u64 base, u64 size)
 {
 	int type;
 
 	type = e820__get_entry_type(base, base + size - 1);
 	if (type == E820_TYPE_RAM) {
-		e820__range_update(base, size, E820_TYPE_RAM,
-				   E820_TYPE_RESERVED);
-		return 1;
+		pr_info("memblock reserve base: %llx size: %llx\n", base, size);
+		memblock_reserve(base, size);
 	}
-
-	return 0;
 }
 
 /*
- * For Intel, certain reqions of memory must be marked as reserved in the e820
- * memory map if they are not already. This includes the TXT HEAP, the ACM area,
- * the TXT private register bank. Normally these are properly reserved by
- * firmware but if it was not done, do it now.
+ * For Intel, certain regions of memory must be marked as reserved by putting
+ * them on the memblock reserved list if they are not already e820 reserved.
+ * This includes:
+ *  - The TXT HEAP
+ *  - The ACM area
+ *  - The TXT private register bank
+ *  - The MDR list sent to the MLE by the ACM (see TXT specification)
+ *  (Normally the above are properly reserved by firmware but if it was not
+ *  done, reserve them now)
+ *  - The AP wake block
+ *  - TPM log external to the TXT heap
  *
- * Also the Memory Descriptor Ranges that are passed to the MLE (see TXT
- * specification) may need to be reserved depeding on their type.
+ * Also if the low PMR doesn't cover all memory < 4G, any RAM regions above
+ * the low PMR must be reservered too.
  */
 static void __init slaunch_txt_reserve(void __iomem *txt)
 {
 	struct txt_sinit_memory_descriptor_record *mdr;
 	struct txt_sinit_mle_data *sinit_mle_data;
 	void *mdrs;
-	u64 base, size;
+	u64 base, size, heap_base, heap_size;
 	u32 field_offset, mdrnum, mdroffset, mdrslen, i;
-	int updated = 0;
 
 	base = TXT_PRIV_CONFIG_REGS_BASE;
 	size = TXT_PUB_CONFIG_REGS_BASE - TXT_PRIV_CONFIG_REGS_BASE;
-	updated += slaunch_txt_reserve_range(base, size);
+	slaunch_txt_reserve_range(base, size);
 
-	memcpy_fromio(&base, txt + TXT_CR_HEAP_BASE, sizeof(u64));
-	memcpy_fromio(&size, txt + TXT_CR_HEAP_SIZE, sizeof(u64));
-	updated += slaunch_txt_reserve_range(base, size);
+	memcpy_fromio(&heap_base, txt + TXT_CR_HEAP_BASE, sizeof(u64));
+	memcpy_fromio(&heap_size, txt + TXT_CR_HEAP_SIZE, sizeof(u64));
+	slaunch_txt_reserve_range(heap_base, heap_size);
 
 	memcpy_fromio(&base, txt + TXT_CR_SINIT_BASE, sizeof(u64));
 	memcpy_fromio(&size, txt + TXT_CR_SINIT_SIZE, sizeof(u64));
-	updated += slaunch_txt_reserve_range(base, size);
+	slaunch_txt_reserve_range(base, size);
 
 	field_offset = offsetof(struct txt_sinit_mle_data,
 				sinit_vtd_dmar_table_size);
@@ -277,7 +292,7 @@ static void __init slaunch_txt_reserve(void __iomem *txt)
 	early_memunmap(sinit_mle_data, field_offset);
 
 	if (!mdrnum)
-		goto out;
+		goto nomdr;
 
 	mdrslen = (mdrnum * sizeof(struct txt_sinit_memory_descriptor_record));
 
@@ -290,17 +305,23 @@ static void __init slaunch_txt_reserve(void __iomem *txt)
 	for (i = 0; i < mdrnum; i++, mdr++) {
 		/* Spec says some entries can have length 0, ignore them */
 		if (mdr->type > 0 && mdr->length > 0)
-			updated += slaunch_txt_reserve_range(mdr->address,
-							     mdr->length);
+			slaunch_txt_reserve_range(mdr->address, mdr->length);
 	}
 
 	early_memunmap(mdrs, mdroffset + mdrslen - 8);
 
-out:
-	if (updated) {
-		e820__update_table(e820_table);
-		pr_info("TXT altered physical RAM map:\n");
-		e820__print_table("TXT-reserve");
+nomdr:
+	slaunch_txt_reserve_range(ap_wake_info.ap_wake_block,
+				  ap_wake_info.ap_wake_block_size);
+
+	if (evtlog_addr < heap_base || evtlog_addr > (heap_base + heap_size))
+		slaunch_txt_reserve_range(evtlog_addr, evtlog_size);
+
+	for (i = 0; i < e820_table->nr_entries; i++) {
+		base = e820_table->entries[i].addr;
+		size = e820_table->entries[i].size;
+		if ((base > vtd_pmr_lo_size) && (base < 0x100000000ULL))
+			slaunch_txt_reserve_range(base, size);
 	}
 }
 
@@ -353,8 +374,11 @@ static void __init slaunch_copy_dmar_table(void __iomem *txt)
 /*
  * The location of the safe AP wake code block is stored in the TXT heap.
  * Fetch it here in the early init code for later use in SMP startup.
+ *
+ * Also get the TPM event log values that may have to be put on the
+ * memblock reserve list later.
  */
-static void __init slaunch_fetch_ap_wake_block(void __iomem *txt)
+static void __init slaunch_fetch_os_mle_fields(void __iomem *txt)
 {
 	struct txt_os_mle_data *os_mle_data;
 	u8 *jmp_offset;
@@ -363,9 +387,13 @@ static void __init slaunch_fetch_ap_wake_block(void __iomem *txt)
 					       sizeof(struct txt_os_mle_data));
 
 	ap_wake_info.ap_wake_block = os_mle_data->ap_wake_block;
+	ap_wake_info.ap_wake_block_size = os_mle_data->ap_wake_block_size;
 
 	jmp_offset = os_mle_data->mle_scratch + SL_SCRATCH_AP_JMP_OFFSET;
 	ap_wake_info.ap_jmp_offset = *((u32 *)jmp_offset);
+
+	evtlog_addr = os_mle_data->evtlog_addr;
+	evtlog_size = os_mle_data->evtlog_size;
 
 	early_memunmap(os_mle_data, sizeof(struct txt_os_mle_data));
 }
@@ -439,7 +467,7 @@ static void __init slaunch_setup_intel(void)
 	memcpy_toio(txt + TXT_CR_CMD_OPEN_LOCALITY1, &val, sizeof(u64));
 	memcpy_fromio(&val, txt + TXT_CR_E2STS, sizeof(u64));
 
-	slaunch_fetch_ap_wake_block(txt);
+	slaunch_fetch_os_mle_fields(txt);
 
 	slaunch_verify_pmrs(txt);
 
@@ -465,6 +493,56 @@ void __init slaunch_setup(void)
 	    vendor[3] == INTEL_CPUID_MFGID_EDX)
 		slaunch_setup_intel();
 }
+
+#define SL_FS_ENTRIES		10
+/* root directory node must be last */
+#define SL_ROOT_DIR_ENTRY	(SL_FS_ENTRIES - 1)
+#define SL_TXT_DIR_ENTRY	(SL_FS_ENTRIES - 2)
+#define SL_TXT_FILE_FIRST	(SL_TXT_DIR_ENTRY - 1)
+#define SL_TXT_ENTRY_COUNT	7
+
+#define DECLARE_TXT_PUB_READ_U(size, fmt, msg_size)			\
+static ssize_t txt_pub_read_u##size(unsigned int offset,		\
+		loff_t *read_offset,					\
+		size_t read_len,					\
+		char __user *buf)					\
+{									\
+	void __iomem *txt;						\
+	char msg_buffer[msg_size];					\
+	u##size reg_value = 0;						\
+	txt = ioremap(TXT_PUB_CONFIG_REGS_BASE,				\
+			TXT_NR_CONFIG_PAGES * PAGE_SIZE);		\
+	if (IS_ERR(txt))						\
+		return PTR_ERR(txt);					\
+	memcpy_fromio(&reg_value, txt + offset, sizeof(u##size));	\
+	iounmap(txt);							\
+	snprintf(msg_buffer, msg_size, fmt, reg_value);			\
+	return simple_read_from_buffer(buf, read_len, read_offset,	\
+			&msg_buffer, msg_size);				\
+}
+
+DECLARE_TXT_PUB_READ_U(8, "%#04x\n", 6);
+DECLARE_TXT_PUB_READ_U(32, "%#010x\n", 12);
+DECLARE_TXT_PUB_READ_U(64, "%#018llx\n", 20);
+
+#define DECLARE_TXT_FOPS(reg_name, reg_offset, reg_size)		\
+static ssize_t txt_##reg_name##_read(struct file *flip,			\
+		char __user *buf, size_t read_len, loff_t *read_offset)	\
+{									\
+	return txt_pub_read_u##reg_size(reg_offset, read_offset,	\
+			read_len, buf);					\
+}									\
+static const struct file_operations reg_name##_ops = {			\
+	.read = txt_##reg_name##_read,					\
+}
+
+DECLARE_TXT_FOPS(sts, TXT_CR_STS, 64);
+DECLARE_TXT_FOPS(ests, TXT_CR_ESTS, 8);
+DECLARE_TXT_FOPS(errorcode, TXT_CR_ERRORCODE, 32);
+DECLARE_TXT_FOPS(didvid, TXT_CR_DIDVID, 64);
+DECLARE_TXT_FOPS(e2sts, TXT_CR_E2STS, 64);
+DECLARE_TXT_FOPS(ver_emif, TXT_CR_VER_EMIF, 32);
+DECLARE_TXT_FOPS(scratchpad, TXT_CR_SCRATCHPAD, 64);
 
 /*
  * Securityfs exposure
@@ -535,41 +613,80 @@ static const struct file_operations sl_evtlog_ops = {
 	.llseek	= default_llseek,
 };
 
-#define SL_DIR_ENTRY	1 /* directoy node must be last */
-#define SL_FS_ENTRIES	2
-
 static struct dentry *fs_entries[SL_FS_ENTRIES];
+
+struct sfs_file {
+	int parent;
+	const char *name;
+	const struct file_operations *fops;
+};
+
+static const struct sfs_file sl_files[] = {
+	{ SL_TXT_DIR_ENTRY, "sts", &sts_ops },
+	{ SL_TXT_DIR_ENTRY, "ests", &ests_ops },
+	{ SL_TXT_DIR_ENTRY, "errorcode", &errorcode_ops },
+	{ SL_TXT_DIR_ENTRY, "didvid", &didvid_ops },
+	{ SL_TXT_DIR_ENTRY, "ver_emif", &ver_emif_ops },
+	{ SL_TXT_DIR_ENTRY, "scratchpad", &scratchpad_ops },
+	{ SL_TXT_DIR_ENTRY, "e2sts", &e2sts_ops }
+};
+
+static int sl_create_file(int entry, int parent, const char *name,
+		const struct file_operations *ops)
+{
+	if (entry < 0 || entry > SL_TXT_DIR_ENTRY)
+		return -EINVAL;
+	fs_entries[entry] = securityfs_create_file(name, 0440,
+			fs_entries[parent], NULL, ops);
+	if (IS_ERR(fs_entries[entry])) {
+		pr_err("Error creating securityfs %s file\n", name);
+		return PTR_ERR(fs_entries[entry]);
+	}
+	return 0;
+}
 
 static long slaunch_expose_securityfs(void)
 {
 	long ret = 0;
-	int entry = SL_DIR_ENTRY;
+	int i = 0;
 
-	fs_entries[entry] = securityfs_create_dir("slaunch", NULL);
-	if (IS_ERR(fs_entries[entry])) {
-		pr_err("Error creating securityfs sl_evt_log directory\n");
-		ret = PTR_ERR(fs_entries[entry]);
+	fs_entries[SL_ROOT_DIR_ENTRY] = securityfs_create_dir("slaunch", NULL);
+	if (IS_ERR(fs_entries[SL_ROOT_DIR_ENTRY])) {
+		pr_err("Error creating securityfs slaunch root directory\n");
+		ret = PTR_ERR(fs_entries[SL_ROOT_DIR_ENTRY]);
 		goto err;
 	}
 
-	if (sl_evtlog.addr > 0) {
-		entry--;
-		fs_entries[entry] = securityfs_create_file(sl_evtlog.name,
-					   S_IRUSR | S_IRGRP,
-					   fs_entries[SL_DIR_ENTRY], NULL,
-					   &sl_evtlog_ops);
-		if (IS_ERR(fs_entries[entry])) {
-			pr_err("Error creating securityfs %s file\n",
-				sl_evtlog.name);
-			ret = PTR_ERR(fs_entries[entry]);
+	if (sl_flags & SL_FLAG_ARCH_TXT) {
+		fs_entries[SL_TXT_DIR_ENTRY] = securityfs_create_dir("txt",
+				fs_entries[SL_ROOT_DIR_ENTRY]);
+		if (IS_ERR(fs_entries[SL_TXT_DIR_ENTRY])) {
+			pr_err("Error creating securityfs txt directory\n");
+			ret = PTR_ERR(fs_entries[SL_TXT_DIR_ENTRY]);
 			goto err_dir;
 		}
+
+		for (i = 0; i < SL_TXT_ENTRY_COUNT; i++) {
+			ret = sl_create_file(SL_TXT_FILE_FIRST - i,
+					sl_files[i].parent, sl_files[i].name,
+					sl_files[i].fops);
+			if (ret)
+				goto err_dir;
+		}
+	}
+
+	if (sl_evtlog.addr > 0) {
+		ret = sl_create_file(0, SL_ROOT_DIR_ENTRY, sl_evtlog.name,
+				&sl_evtlog_ops);
+		if (ret)
+			goto err_dir;
 	}
 
 	return 0;
 
 err_dir:
-	securityfs_remove(fs_entries[SL_DIR_ENTRY]);
+	for (i = 0; i <= SL_ROOT_DIR_ENTRY; i++)
+		securityfs_remove(fs_entries[i]);
 err:
 	return ret;
 }
@@ -668,13 +785,13 @@ late_initcall(slaunch_late_init);
 
 __exitcall(slaunch_exit);
 
-static inline void txt_getsec_sexit(void)
+static inline void smx_getsec_sexit(void)
 {
 	asm volatile (".byte 0x0f,0x37\n"
 		      : : "a" (SMX_X86_GETSEC_SEXIT));
 }
 
-void slaunch_sexit(void)
+void slaunch_finalize(int do_sexit)
 {
 	void __iomem *config;
 	u64 one = 1, val;
@@ -682,15 +799,10 @@ void slaunch_sexit(void)
 	if (!(slaunch_get_flags() & (SL_FLAG_ACTIVE|SL_FLAG_ARCH_TXT)))
 		return;
 
-	if (smp_processor_id() != 0) {
-		pr_err("Error TXT SEXIT must be called on CPU 0\n");
-		return;
-	}
-
 	config = ioremap(TXT_PRIV_CONFIG_REGS_BASE, TXT_NR_CONFIG_PAGES *
 			 PAGE_SIZE);
 	if (!config) {
-		pr_err("Error SEXIT failed to ioremap TXT private reqs\n");
+		pr_emerg("Error SEXIT failed to ioremap TXT private reqs\n");
 		return;
 	}
 
@@ -718,17 +830,27 @@ void slaunch_sexit(void)
 	config = ioremap(TXT_PUB_CONFIG_REGS_BASE, TXT_NR_CONFIG_PAGES *
 			 PAGE_SIZE);
 	if (!config) {
-		pr_err("Error SEXIT failed to ioremap TXT public reqs\n");
+		pr_emerg("Error SEXIT failed to ioremap TXT public reqs\n");
 		return;
 	}
 
 	memcpy_fromio(&val, config + TXT_CR_E2STS, sizeof(u64));
 
+	pr_emerg("TXT clear secrets bit and unlock memory complete.");
+
+	if (!do_sexit)
+		return;
+
+	if (smp_processor_id() != 0) {
+		pr_emerg("Error TXT SEXIT must be called on CPU 0\n");
+		return;
+	}
+
 	/* Disable SMX mode */
 	cr4_set_bits(X86_CR4_SMXE);
 
 	/* Do the SEXIT SMX operation */
-	txt_getsec_sexit();
+	smx_getsec_sexit();
 
 	pr_emerg("TXT SEXIT complete.");
 }
